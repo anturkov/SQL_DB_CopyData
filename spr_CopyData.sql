@@ -3,7 +3,7 @@ GO
 
 /*
 Author: Antonio Turkovic (Microsoft Data&AI CE)
-Version: 202011-02
+Version: 202011-01
 Supported SQL Server Versions: >= SQL Server 2016 SP2 (Standard and Enterprise Edition)	
 
 Description:
@@ -31,6 +31,8 @@ Parameter:
 		- This procedure is not supported for productional use
 		- Default value: 0
 
+	- @batchSize: Specify the maximum number of rows to be written per batch (improves performance on very large tables)
+		- Default value: 10000
 
 Example:
 	EXEC dbo.spr_CopyData @sourceDB = 'testDB', @destinationDB = 'testDB_Copy'
@@ -50,7 +52,11 @@ CREATE PROCEDURE spr_CopyData
 	@destinationDB NVARCHAR(MAX),
 
 	-- Clone the source database (not for productional use)
-	@cloneDB BIT = 0
+	@cloneDB BIT = 0,
+
+	-- Batch Size to write the data
+	@batchSize INT = 10000
+
 AS
 BEGIN
 	SET NOCOUNT ON;
@@ -114,6 +120,9 @@ BEGIN
 
 	-- Table for failed Tables
 	DECLARE @tblFailed TABLE (tableName NVARCHAR(MAX))
+
+	-- Table for Primary Keys
+	DECLARE @tblPrimaryKeys TABLE (tableName NVARCHAR(MAX), colName NVARCHAR(MAX))
 
 	-- Cursor Variables --> Object
 	DECLARE @curObjName NVARCHAR(MAX)
@@ -262,9 +271,35 @@ BEGIN
 		RAISERROR(@msg, 10, 1) WITH NOWAIT;
 		RETURN;
 	END CATCH
+	 
+	-- CHECK ROW COUNT IN SOURCE
+	DECLARE @tmpRowCountTableName NVARCHAR(MAX)
+	DECLARE curCheckRowCountsInSource CURSOR FOR
+		SELECT objName FROM @tblTableNames
+
+	OPEN curCheckRowCountsInSource
+	FETCH NEXT FROM curCheckRowCountsInSource INTO @tmpRowCountTableName
+	WHILE @@FETCH_STATUS = 0
+	BEGIN
+		SET @cmd = 'SELECT ''' + @tmpRowCountTableName + ''', COUNT(1) FROM [' + @sourceDB + '].' + @tmpRowCountTableName
+		
+		BEGIN TRY
+			INSERT INTO @chkSourceDBRowCount (tableName, rowCounts)
+			EXEC sp_executesql @cmd
+		END TRY
+		BEGIN CATCH
+			SET @msg = FORMAT(GETDATE(), 'yyyy-MM-dd HH:mm:ss') + ' | ERROR | Could not count rows in source table ' + @tmpRowCountTableName + CHAR(13) + CHAR(10) + ERROR_MESSAGE()
+			RAISERROR(@msg, 10, 1) WITH NOWAIT;
+			RETURN;
+		END CATCH
+
+		FETCH NEXT FROM curCheckRowCountsInSource INTO @tmpRowCountTableName
+	END
+	CLOSE curCheckRowCountsInSource
+	DEALLOCATE curCheckRowCountsInSource
 
 	-- CHECK ROW COUNT IN DESTINATION
-	DECLARE @tmpRowCountTableName NVARCHAR(MAX)
+	SET @tmpRowCountTableName = ''
 	DECLARE curCheckRowCountsInDestination CURSOR FOR
 		SELECT objName FROM @tblTableNames
 
@@ -482,6 +517,34 @@ BEGIN
 	SET @msg = FORMAT(GETDATE(), 'yyyy-MM-dd HH:mm:ss') + ' | INFO | Validation finished - starting process'
 	RAISERROR(@msg, 10, 1) WITH NOWAIT
 
+
+	-- Collect Primary Keys
+	SET @cmd = '
+		USE [' + @sourceDB + '];
+		SELECT ''['' + SCHEMA_NAME(ta.schema_id) + ''].['' + ta.name + '']'' AS  TableName,
+			   ''['' + col.name+ '']'' AS  ColumnName
+		FROM sys.tables ta
+		INNER JOIN sys.indexes ind
+			ON ind.object_id = ta.object_id
+		INNER JOIN sys.index_columns indcol
+			ON indcol.object_id = ta.object_id
+				AND indcol.index_id = ind.index_id
+		INNER JOIN sys.columns col
+			ON col.object_id = ta.object_id
+				AND col.column_id = indcol.column_id
+		WHERE ind.is_primary_key = 1
+	'
+	BEGIN TRY
+		INSERT INTO @tblPrimaryKeys (tableName, colName)
+		EXEC sp_executesql @cmd
+	END TRY
+	BEGIN CATCH
+		SET @msg = FORMAT(GETDATE(), 'yyyy-MM-dd HH:mm:ss') + ' | ERROR | Could not collect PRIMARY KEY columns - batch processing will not work' + CHAR(13) + CHAR(10) + ERROR_MESSAGE()
+		RAISERROR(@msg, 10, 1) WITH NOWAIT;
+	END CATCH
+
+
+
 	/*
 	
 	DISABLE OBJECTS
@@ -620,6 +683,13 @@ BEGIN
 
 	*/
 
+	/* FOR BATCH PROCESSING */
+	DECLARE @batchRowCount BIGINT = 1
+	DECLARE @tmpWhereClause NVARCHAR(MAX) = ''
+	DECLARE @tmpOrderByClause NVARCHAR(MAX) = ''
+	DECLARE @isBatch BIT = 0
+	DECLARE @tmpRowCount BIGINT = 0
+
 	DECLARE @curCopyTableName NVARCHAR(MAX)
 	DECLARE @curCopyInsertColumns NVARCHAR(MAX)
 	DECLARE @curCopySelectColumns NVARCHAR(MAX)
@@ -643,37 +713,157 @@ BEGIN
 	WHILE @@FETCH_STATUS = 0
 	BEGIN
 		
-		SET @msg = FORMAT(GETDATE(), 'yyyy-MM-dd HH:mm:ss') + ' | INFO | Copy data to table ' + @curCopyTableName
-		RAISERROR(@msg, 10, 1) WITH NOWAIT;
+		-- RESET VARS FOR BATCH
+		SET @isBatch = 0
+		SET @batchRowCount = 1
+		SET @tmpWhereClause = ''
+		SET @tmpOrderByClause = ''
+		SET @tmpRowCount = 0
 
-		SET @cmd = 'USE [' + @destinationDB + '];'
-		
-		-- Check if IDENTITY
-		IF(@curCopyIsIdentity = 1)
+		-- Check if Batch Processing makes sense
+		IF ((SELECT rowCounts FROM @chkSourceDBRowCount WHERE tableName = @curCopyTableName) > @batchSize)
 		BEGIN
-			SET @cmd += 'SET IDENTITY_INSERT ' + @curCopyTableName + ' ON; '
+			-- Check if the table has PK
+			IF EXISTS (
+				SELECT 1 FROM @tblPrimaryKeys WHERE tableName = @curCopyTableName
+			)
+			BEGIN
+				SET @isBatch = 1
+			END
 		END
 		
-		-- INSERT ... SELECT
-		SET @cmd += 'INSERT INTO [' + @destinationDB + '].' + @curCopyTableName + ' (' + @curCopyInsertColumns + ') 
-					 SELECT ' + @curCopySelectColumns + ' FROM [' + @sourceDB + '].' + @curCopyTableName + '; '; 
-
-		-- Check if IDENTITY
-		IF(@curCopyIsIdentity = 1)
+		-- normal insert (all at once)
+		IF(@isBatch = 0)
 		BEGIN
-			SET @cmd += 'SET IDENTITY_INSERT ' + @curCopyTableName + ' OFF; '
-		END
-
-		-- EXECUTE
-		BEGIN TRY
-			EXEC sp_executesql @cmd
-		END TRY
-		BEGIN CATCH
-			SET @msg = FORMAT(GETDATE(), 'yyyy-MM-dd HH:mm:ss') + ' | ERROR | Could not copy data to table ' + @curCopyTableName + CHAR(13) + CHAR(10) + ERROR_MESSAGE()
+			SET @msg = FORMAT(GETDATE(), 'yyyy-MM-dd HH:mm:ss') + ' | INFO | Copy data to table ' + @curCopyTableName + ' (no batch processing)'
 			RAISERROR(@msg, 10, 1) WITH NOWAIT;
-			INSERT INTO @tblFailed (tableName) VALUES (@curCopyTableName)
-			SET @errorCount += 1;
-		END CATCH
+
+			SET @cmd = 'USE [' + @destinationDB + ']; '
+			-- Check if IDENTITY
+			IF(@curCopyIsIdentity = 1)
+			BEGIN
+				SET @cmd += 'SET IDENTITY_INSERT ' + @curCopyTableName + ' ON; '
+			END
+		
+			-- INSERT ... SELECT
+			SET @cmd += 'INSERT INTO [' + @destinationDB + '].' + @curCopyTableName + ' (' + @curCopyInsertColumns + ') 
+						 SELECT ' + @curCopySelectColumns + ' FROM [' + @sourceDB + '].' + @curCopyTableName + '; '; 
+
+			-- Check if IDENTITY
+			IF(@curCopyIsIdentity = 1)
+			BEGIN
+				SET @cmd += 'SET IDENTITY_INSERT ' + @curCopyTableName + ' OFF; '
+			END
+
+			-- EXECUTE
+			BEGIN TRY
+				EXEC sp_executesql @cmd
+			END TRY
+			BEGIN CATCH
+				SET @msg = FORMAT(GETDATE(), 'yyyy-MM-dd HH:mm:ss') + ' | ERROR | Could not copy data to table ' + @curCopyTableName + CHAR(13) + CHAR(10) + ERROR_MESSAGE()
+				RAISERROR(@msg, 10, 1) WITH NOWAIT;
+				INSERT INTO @tblFailed (tableName) VALUES (@curCopyTableName)
+				SET @errorCount += 1;
+			END CATCH
+		END
+
+		-- BATCH PROCESSING
+		IF(@isBatch = 1)
+		BEGIN
+			SET @msg = FORMAT(GETDATE(), 'yyyy-MM-dd HH:mm:ss') + ' | INFO | Copy data to table ' + @curCopyTableName + ' (with batch processing)'
+			RAISERROR(@msg, 10, 1) WITH NOWAIT;
+
+			-- SET WHERE CLAUSE
+			SELECT @tmpWhereClause += ' AND [' + @sourceDB + '].' + @curCopyTableName + '.' + colName + ' = [' + @destinationDB + '].' + @curCopyTableName + '.' + colName
+			FROM @tblPrimaryKeys
+			WHERE tableName = @curCopyTableName
+			-- Replace first " AND "
+			SET @tmpWhereClause = RIGHT(@tmpWhereClause, LEN(@tmpWhereClause) - 5)
+
+			-- SET ORDER BY CLAUSE
+			SELECT @tmpOrderByClause += ', [' + @sourceDB + '].' + @curCopyTableName + '.' + colName
+			FROM @tblPrimaryKeys
+			WHERE tableName = @curCopyTableName
+			--Replace first ","
+			SET @tmpOrderByClause = RIGHT(@tmpOrderByClause, LEN(@tmpOrderByClause) - 1)
+			
+
+			WHILE (@batchRowCount > 0)
+			BEGIN
+
+				SET @cmd = 'USE [' + @destinationDB + ']; '
+				-- Check if IDENTITY
+				IF(@curCopyIsIdentity = 1)
+				BEGIN
+					SET @cmd += 'SET IDENTITY_INSERT ' + @curCopyTableName + ' ON; '
+				END
+
+				-- INSERT SELECT
+				SET @cmd += 'INSERT INTO [' + @destinationDB + '].' + @curCopyTableName + ' (' + @curCopyInsertColumns + ') ' +
+							'SELECT TOP (' + CONVERT(NVARCHAR(MAX), @batchSize) + ') ' + @curCopySelectColumns + 
+							' FROM [' + @sourceDB + '].' + @curCopyTableName +
+							' WHERE NOT EXISTS ( SELECT 1 FROM [' + @destinationDB + '].' + @curCopyTableName + ' WHERE ' + @tmpWhereClause + ' ) ' +
+							' ORDER BY ' + @tmpOrderByClause + '; '
+
+				-- Check if IDENTITY
+				IF(@curCopyIsIdentity = 1)
+				BEGIN
+					SET @cmd += 'SET IDENTITY_INSERT ' + @curCopyTableName + ' OFF; ';
+				END
+				/*				
+				SET @msg = CONVERT(NVARCHAR(4000), @cmd)
+				RAISERROR(@msg, 10, 1) WITH NOWAIT;
+				*/
+				BEGIN TRY
+					EXEC sp_executesql @cmd
+				END TRY
+				BEGIN CATCH
+					SET @msg = FORMAT(GETDATE(), 'yyyy-MM-dd HH:mm:ss') + ' | ERROR | Could not copy data to table ' + @curCopyTableName + CHAR(13) + CHAR(10) + ERROR_MESSAGE()
+					RAISERROR(@msg, 10, 1) WITH NOWAIT;
+					INSERT INTO @tblFailed (tableName) VALUES (@curCopyTableName)
+					SET @errorCount += 1;
+					BREAK;
+				END CATCH
+
+				-- SELECT ROW COUNTS
+				SET @cmd = 'SELECT @dynResult = COUNT(1)
+							FROM [' + @destinationDB + '].' + @curCopyTableName
+				SET @param = '@dynResult BIGINT OUTPUT'
+				BEGIN TRY
+					EXEC sp_executesql @cmd, @param, @dynResult = @tmpRowCount OUTPUT
+				END TRY
+				BEGIN CATCH
+					SET @msg = FORMAT(GETDATE(), 'yyyy-MM-dd HH:mm:ss') + ' | ERROR | Could not calculate remaining rows in table ' + @curCopyTableName + CHAR(13) + CHAR(10) + ERROR_MESSAGE()
+					RAISERROR(@msg, 10, 1) WITH NOWAIT;
+					INSERT INTO @tblFailed (tableName) VALUES (@curCopyTableName)
+					SET @errorCount += 1;
+					BREAK;
+				END CATCH
+
+				-- Compare RowCounts
+				IF((SELECT rowCounts FROM @chkSourceDBRowCount WHERE tableName = @curCopyTableName) != @tmpRowCount)
+				BEGIN
+					SET @msg = CONVERT(NVARCHAR(32), @tmpRowCount) + ' rows written'
+					RAISERROR(@msg, 10, 1) WITH NOWAIT;
+					SET @batchRowCount = 1
+				END
+				ELSE
+				BEGIN
+					SET @msg = CONVERT(NVARCHAR(32), @tmpRowCount) + ' rows written'
+					RAISERROR(@msg, 10, 1) WITH NOWAIT;
+					SET @batchRowCount = 0
+				END
+
+				-- If there are more rows in destination than in source --> break
+				IF((SELECT rowCounts FROM @chkSourceDBRowCount WHERE tableName = @curCopyTableName) < @tmpRowCount)
+				BEGIN
+					SET @msg = FORMAT(GETDATE(), 'yyyy-MM-dd HH:mm:ss') + ' | WARN | More rows have been written to destination DB table than initially available on source table ' + @curCopyTableName
+					RAISERROR(@msg, 10, 1) WITH NOWAIT;
+					SET @batchRowCount = 0
+				END
+
+			END
+		END
 
 		FETCH NEXT FROM curCopyTable INTO @curCopyTableName, @curCopyInsertColumns, @curCopySelectColumns, @curCopyIsIdentity
 	END

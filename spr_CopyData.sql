@@ -3,7 +3,7 @@ GO
 
 /*
 Author: Antonio Turkovic (Microsoft Data&AI CE)
-Version: 202011-01
+Version: 202011-02
 Supported SQL Server Versions: >= SQL Server 2016 SP2 (Standard and Enterprise Edition)	
 
 Description:
@@ -17,7 +17,7 @@ Requirements:
 - User must have SYSADMIN privileges
 - Ensure you have enough disk space (2.5 - 3 times the data)
 - Call the procedure only on the SQL Server itself to prevent any remote procedure timeouts
-- SQL Server Version must be newer than SQL Server 2016 SP2
+- SQL Server Version must be newer than or equal SQL Server 2016 SP2
 - BEFORE running the process, perform a FULL backup of your database (destination database will be set to SIMPLE recovery model)
 
 Parameter:
@@ -33,7 +33,7 @@ Parameter:
 
 
 Example:
-	EXEC dbo.spr_CopyData @source = 'testDB', @destinationDB = 'testDB_Copy'
+	EXEC dbo.spr_CopyData @sourceDB = 'testDB', @destinationDB = 'testDB_Copy'
 
 Output:
 	- Failed Tables: Could not copy these table (more details in the "Messages" tab)
@@ -168,7 +168,7 @@ BEGIN
 		SET @msg = FORMAT(GETDATE(), 'yyyy-MM-dd HH:mm:ss') + ' | INFO | Cloning database ' + @sourceDB + ' to ' + @destinationDB
 		RAISERROR(@msg, 10, 1) WITH NOWAIT;
 
-		SET @cmd = 'DBCC CLONEDATABASE (' + @sourceDB + ', ' + @destinationDB + ') WITH NO_STATISTICS;'
+		SET @cmd = 'DBCC CLONEDATABASE (' + @sourceDB + ', ' + @destinationDB + ') WITH NO_STATISTICS, NO_QUERYSTORE, VERIFY_CLONEDB;'
 		BEGIN TRY
 			EXEC sp_executesql @cmd
 		END TRY
